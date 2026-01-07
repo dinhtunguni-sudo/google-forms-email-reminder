@@ -1,0 +1,30 @@
+const CONFIG = {
+  SHEET_NAME: "Form Responses 1",
+
+  // Column numbers (1-based, as shown in Google Sheets)
+  // Update these to match your sheet layout.
+  COL_TASK: 2,
+  COL_DESCRIPTION: 3,
+  COL_EVENT_DATE: 4,
+  COL_MAIN_EMAIL: 5,
+  COL_EXTRA_EMAILS: 6,
+  COL_REMINDER_OPTION: 7,
+  COL_RECURRENCE_OPTION: 8,
+  COL_EVENT_TIME: 9,
+  COL_STATUS: 10,
+  COL_COMPLETED: 11, // optional: checkbox TRUE/FALSE or text like "done"
+
+  // Allowed sending window: send within [remindTime, remindTime + window]
+  SEND_WINDOW_MINUTES: 20,
+
+  // If "1 day before" is chosen, send at this time on the day before
+  ONE_DAY_BEFORE_AT: { hour: 9, minute: 0 },
+
+  // Shift Sundays to Monday for event dates and reminder dates
+  SHIFT_SUNDAY_TO_MONDAY: true,
+
+  // Status strings written back to the sheet
+  STATUS_SENT: "SENT",
+  STATUS_MISSING_DATE_TIME: "MISSING DATE/TIME",
+  STATUS_MISSING_EMAIL: "MISSING EMAIL",
+};
