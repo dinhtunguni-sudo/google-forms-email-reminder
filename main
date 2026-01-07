@@ -2,36 +2,6 @@
  * Google Forms → Sheets Email Reminder Automation
  *************************************************/
 
-const CONFIG = {
-  SHEET_NAME: "Form Responses 1",
-
-  // Column numbers (1-based, as seen in the Google Sheet UI)
-  COL_TASK: 2,
-  COL_DESCRIPTION: 3,
-  COL_EVENT_DATE: 4,
-  COL_MAIN_EMAIL: 5,
-  COL_EXTRA_EMAILS: 6,
-  COL_REMINDER_OPTION: 7,
-  COL_RECURRENCE_OPTION: 8,
-  COL_EVENT_TIME: 9,
-  COL_STATUS: 10,
-  COL_COMPLETED: 11, // optional: checkbox TRUE/FALSE or text (e.g., "done")
-
-  // Sending window: allow sending from remindTime up to this many minutes after
-  SEND_WINDOW_MINUTES: 20,
-
-  // If "1 day before" is chosen, send at this time on the day before
-  ONE_DAY_BEFORE_AT: { hour: 9, minute: 0 },
-
-  // Shift Sunday dates to Monday (event and recurrence)
-  SHIFT_SUNDAY_TO_MONDAY: true,
-
-  // Status values written to the sheet
-  STATUS_SENT: "SENT",
-  STATUS_MISSING_DATE_TIME: "MISSING DATE/TIME",
-  STATUS_MISSING_EMAIL: "MISSING EMAIL",
-};
-
 function parseDateCell(value) {
   if (value instanceof Date) return value;
 
@@ -114,11 +84,11 @@ function isCompleted(value) {
 /**
  * Parse reminder option into one of:
  * - { type: "at_time" }
- * - { type: "minutes_before", minutes: number }
- * - { type: "hours_before", hours: number }
- * - { type: "days_before", days: number }
+ * - { type: "minutes_before", minutes }
+ * - { type: "hours_before", hours }
+ * - { type: "days_before", days }
  *
- * Supported inputs (examples):
+ * Supported inputs:
  * - number: 10, 30, 60, 1440 (minutes before)
  * - strings: "10 minutes before", "30 minutes", "1 hour before", "1 day before", "at time"
  */
@@ -126,7 +96,6 @@ function parseReminderOption(value) {
   if (value == null) return { type: "at_time" };
 
   if (typeof value === "number" && isFinite(value)) {
-    // interpret as minutes before
     const minutes = Math.max(0, Math.round(value));
     if (minutes === 0) return { type: "at_time" };
     if (minutes % 1440 === 0) return { type: "days_before", days: minutes / 1440 };
@@ -139,7 +108,6 @@ function parseReminderOption(value) {
 
   if (s.includes("at time") || s === "at") return { type: "at_time" };
 
-  // Extract first integer number if present
   const nMatch = s.match(/(\d+)/);
   const n = nMatch ? parseInt(nMatch[1], 10) : NaN;
 
@@ -149,7 +117,6 @@ function parseReminderOption(value) {
     if (s.includes("minute")) return { type: "minutes_before", minutes: n };
   }
 
-  // Default fallback
   return { type: "at_time" };
 }
 
@@ -170,10 +137,47 @@ function parseRecurrenceOption(value) {
 }
 
 function shiftSundayToMonday(dateObj) {
-  if (!CONFIG.SHIFT_SUNDAY_TO_MONDAY) return dateObj;
+  if (!CONFIG.SHIFT_SUNDAY_TO_MONDAY) return new Date(dateObj);
   const d = new Date(dateObj);
   if (d.getDay() === 0) d.setDate(d.getDate() + 1);
   return d;
+}
+
+function buildEmailHtml(taskEsc, descEsc, whenStr) {
+  return `
+<div style="font-family:Arial,Helvetica,sans-serif;background:#f6f7fb;padding:24px">
+  <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 6px 18px rgba(0,0,0,.08)">
+    <div style="background:linear-gradient(90deg,#6D28D9,#9333EA);padding:18px 22px;color:#fff">
+      <div style="font-size:14px;opacity:.9">Task Reminder</div>
+      <div style="font-size:20px;font-weight:700;line-height:1.2;margin-top:4px">⏰ Time to act</div>
+    </div>
+
+    <div style="padding:20px 22px;color:#111827">
+      <div style="font-size:16px;line-height:1.6">
+        <div style="margin-bottom:10px"><b>Task:</b><br/>
+          <span style="font-size:18px">${taskEsc}</span>
+        </div>
+
+        <div style="margin-bottom:10px"><b>Description:</b><br/>
+          <span style="color:#374151">${descEsc}</span>
+        </div>
+
+        <div style="margin:14px 0;padding:12px 14px;background:#F3F4F6;border-radius:10px">
+          <div style="font-size:13px;color:#6B7280;margin-bottom:4px">SCHEDULED TIME</div>
+          <div style="font-size:18px;font-weight:700">${whenStr}</div>
+        </div>
+
+        <div style="margin-top:14px;font-size:13px;color:#6B7280">
+          Mark the task as <b>Completed</b> in the sheet to stop future reminders.
+        </div>
+      </div>
+    </div>
+
+    <div style="padding:16px 22px;background:#FAFAFB;border-top:1px solid #EEF2FF;color:#6B7280;font-size:12px;line-height:1.5">
+      This message was sent automatically.
+    </div>
+  </div>
+</div>`;
 }
 
 function checkReminders() {
@@ -200,13 +204,14 @@ function checkReminders() {
       const status = String(row[CONFIG.COL_STATUS - 1] ?? "").trim();
       if (status) continue;
 
-      const completedVal = CONFIG.COL_COMPLETED ? row[CONFIG.COL_COMPLETED - 1] : "";
-      if (CONFIG.COL_COMPLETED && isCompleted(completedVal)) continue;
+      if (CONFIG.COL_COMPLETED) {
+        const completedVal = row[CONFIG.COL_COMPLETED - 1];
+        if (isCompleted(completedVal)) continue;
+      }
 
       const dateVal = row[CONFIG.COL_EVENT_DATE - 1];
       const timeVal = row[CONFIG.COL_EVENT_TIME - 1];
 
-      // Prefer Date objects first, then display values
       const d = parseDateCell(dateVal) || parseDateCell(rowDisp[CONFIG.COL_EVENT_DATE - 1]);
       const t = parseTimeCell(timeVal) || parseTimeCell(rowDisp[CONFIG.COL_EVENT_TIME - 1]);
 
@@ -219,7 +224,6 @@ function checkReminders() {
       eventDate.setHours(t.h, t.m, 0, 0);
       eventDate = shiftSundayToMonday(eventDate);
 
-      // Compute reminder time
       const reminderRaw = row[CONFIG.COL_REMINDER_OPTION - 1];
       const reminder = parseReminderOption(reminderRaw);
 
@@ -234,7 +238,6 @@ function checkReminders() {
         remindTime.setHours(CONFIG.ONE_DAY_BEFORE_AT.hour, CONFIG.ONE_DAY_BEFORE_AT.minute, 0, 0);
         remindTime = shiftSundayToMonday(remindTime);
       } else {
-        // at_time
         remindTime = new Date(eventDate);
       }
 
@@ -243,7 +246,6 @@ function checkReminders() {
       const endMs = startMs + windowMs;
       if (nowMs < startMs || nowMs > endMs) continue;
 
-      // Recipients
       const mainEmail = String(row[CONFIG.COL_MAIN_EMAIL - 1] ?? "").trim();
       let recipients = [];
       if (mainEmail) recipients.push(mainEmail);
@@ -261,55 +263,22 @@ function checkReminders() {
         continue;
       }
 
-      // Email content
-      const task = escapeHtml(row[CONFIG.COL_TASK - 1] ?? "");
-      const desc = escapeHtml(row[CONFIG.COL_DESCRIPTION - 1] ?? "No description");
+      const taskRaw = String(row[CONFIG.COL_TASK - 1] ?? "").trim();
+      const descRaw = String(row[CONFIG.COL_DESCRIPTION - 1] ?? "No description").trim();
+
+      const taskEsc = escapeHtml(taskRaw || "Task");
+      const descEsc = escapeHtml(descRaw);
       const whenStr = Utilities.formatDate(eventDate, tz, "EEE, dd/MM/yyyy HH:mm");
 
-      const subject = `⏰ Reminder: ${String(row[CONFIG.COL_TASK - 1] ?? "Task").trim() || "Task"}`;
-
-      const htmlBody = `
-<div style="font-family:Arial,Helvetica,sans-serif;background:#f6f7fb;padding:24px">
-  <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 6px 18px rgba(0,0,0,.08)">
-    <div style="background:linear-gradient(90deg,#6D28D9,#9333EA);padding:18px 22px;color:#fff">
-      <div style="font-size:14px;opacity:.9">Task Reminder</div>
-      <div style="font-size:20px;font-weight:700;line-height:1.2;margin-top:4px">⏰ Time to act</div>
-    </div>
-
-    <div style="padding:20px 22px;color:#111827">
-      <div style="font-size:16px;line-height:1.6">
-        <div style="margin-bottom:10px"><b>Task:</b><br/>
-          <span style="font-size:18px">${task}</span>
-        </div>
-
-        <div style="margin-bottom:10px"><b>Description:</b><br/>
-          <span style="color:#374151">${desc}</span>
-        </div>
-
-        <div style="margin:14px 0;padding:12px 14px;background:#F3F4F6;border-radius:10px">
-          <div style="font-size:13px;color:#6B7280;margin-bottom:4px">SCHEDULED TIME</div>
-          <div style="font-size:18px;font-weight:700">${whenStr}</div>
-        </div>
-
-        <div style="margin-top:14px;font-size:13px;color:#6B7280">
-          Mark the task as <b>Completed</b> in the sheet to stop future reminders.
-        </div>
-      </div>
-    </div>
-
-    <div style="padding:16px 22px;background:#FAFAFB;border-top:1px solid #EEF2FF;color:#6B7280;font-size:12px;line-height:1.5">
-      This message was sent automatically.
-    </div>
-  </div>
-</div>`;
+      const subject = `⏰ Reminder: ${taskRaw || "Task"}`;
+      const htmlBody = buildEmailHtml(taskEsc, descEsc, whenStr);
 
       MailApp.sendEmail({
         to: recipients.join(","),
         subject,
-        htmlBody: htmlBody,
+        htmlBody,
       });
 
-      // Handle recurrence
       const recurRaw = row[CONFIG.COL_RECURRENCE_OPTION - 1];
       const recur = parseRecurrenceOption(recurRaw);
 
@@ -325,9 +294,8 @@ function checkReminders() {
 
       nextEventDate = shiftSundayToMonday(nextEventDate);
 
-      // Write next date back (keeps same time)
       sheet.getRange(r + 1, CONFIG.COL_EVENT_DATE).setValue(nextEventDate);
-      sheet.getRange(r + 1, CONFIG.COL_STATUS).setValue(""); // reset to allow next cycle
+      sheet.getRange(r + 1, CONFIG.COL_STATUS).setValue("");
     }
   } finally {
     lock.releaseLock();
@@ -340,15 +308,15 @@ function debugRow(rowNumber) {
   const values = range.getValues();
   const display = range.getDisplayValues();
 
-  const r = Math.max(2, Number(rowNumber || 2)) - 1;
-  const row = values[r];
-  const rowDisp = display[r];
+  const rowIdx = Math.max(2, Number(rowNumber || 2)) - 1;
+  const row = values[rowIdx];
+  const rowDisp = display[rowIdx];
 
   const d = parseDateCell(row[CONFIG.COL_EVENT_DATE - 1]) || parseDateCell(rowDisp[CONFIG.COL_EVENT_DATE - 1]);
   const t = parseTimeCell(row[CONFIG.COL_EVENT_TIME - 1]) || parseTimeCell(rowDisp[CONFIG.COL_EVENT_TIME - 1]);
 
   console.log({
-    rowNumber: r + 1,
+    rowNumber: rowIdx + 1,
     dateRaw: row[CONFIG.COL_EVENT_DATE - 1],
     timeRaw: row[CONFIG.COL_EVENT_TIME - 1],
     dateDisplay: rowDisp[CONFIG.COL_EVENT_DATE - 1],
