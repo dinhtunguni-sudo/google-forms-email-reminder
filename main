@@ -1,0 +1,363 @@
+/*************************************************
+ * Google Forms → Sheets Email Reminder Automation
+ *************************************************/
+
+const CONFIG = {
+  SHEET_NAME: "Form Responses 1",
+
+  // Column numbers (1-based, as seen in the Google Sheet UI)
+  COL_TASK: 2,
+  COL_DESCRIPTION: 3,
+  COL_EVENT_DATE: 4,
+  COL_MAIN_EMAIL: 5,
+  COL_EXTRA_EMAILS: 6,
+  COL_REMINDER_OPTION: 7,
+  COL_RECURRENCE_OPTION: 8,
+  COL_EVENT_TIME: 9,
+  COL_STATUS: 10,
+  COL_COMPLETED: 11, // optional: checkbox TRUE/FALSE or text (e.g., "done")
+
+  // Sending window: allow sending from remindTime up to this many minutes after
+  SEND_WINDOW_MINUTES: 20,
+
+  // If "1 day before" is chosen, send at this time on the day before
+  ONE_DAY_BEFORE_AT: { hour: 9, minute: 0 },
+
+  // Shift Sunday dates to Monday (event and recurrence)
+  SHIFT_SUNDAY_TO_MONDAY: true,
+
+  // Status values written to the sheet
+  STATUS_SENT: "SENT",
+  STATUS_MISSING_DATE_TIME: "MISSING DATE/TIME",
+  STATUS_MISSING_EMAIL: "MISSING EMAIL",
+};
+
+function parseDateCell(value) {
+  if (value instanceof Date) return value;
+
+  // Spreadsheet serial date
+  if (typeof value === "number" && isFinite(value)) {
+    const ms = (value - 25569) * 86400 * 1000;
+    const d = new Date(ms);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  if (value && typeof value === "object" && typeof value.toString === "function") {
+    value = value.toString();
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    let s = value.trim();
+
+    // dd/mm/yyyy
+    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) return new Date(+m[3], +m[2] - 1, +m[1]);
+
+    // remove trailing "(...)" and keep GMT offset if present
+    s = s.replace(/\s*\(.*?\)\s*$/, "");
+    const g = s.match(/GMT[+-]\d{4}/);
+    if (g) s = s.substring(0, s.indexOf(g[0]) + g[0].length);
+
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
+function parseTimeCell(value) {
+  if (value instanceof Date) return { h: value.getHours(), m: value.getMinutes() };
+
+  // Spreadsheet time fraction (0..1)
+  if (typeof value === "number" && isFinite(value)) {
+    const totalMins = Math.round(value * 24 * 60);
+    return { h: Math.floor(totalMins / 60) % 24, m: totalMins % 60 };
+  }
+
+  if (value && typeof value === "object" && typeof value.toString === "function") {
+    value = value.toString();
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const m = value.trim().match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+    if (!m) return null;
+
+    let h = +m[1];
+    const min = +m[2];
+    const ap = (m[3] || "").toUpperCase();
+
+    if (ap === "PM" && h < 12) h += 12;
+    if (ap === "AM" && h === 12) h = 0;
+
+    return { h, m: min };
+  }
+
+  return null;
+}
+
+function escapeHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function isCompleted(value) {
+  if (value === true) return true;
+  const s = String(value ?? "").trim().toLowerCase();
+  if (!s) return false;
+  return ["x", "done", "true", "1", "yes", "completed"].includes(s);
+}
+
+/**
+ * Parse reminder option into one of:
+ * - { type: "at_time" }
+ * - { type: "minutes_before", minutes: number }
+ * - { type: "hours_before", hours: number }
+ * - { type: "days_before", days: number }
+ *
+ * Supported inputs (examples):
+ * - number: 10, 30, 60, 1440 (minutes before)
+ * - strings: "10 minutes before", "30 minutes", "1 hour before", "1 day before", "at time"
+ */
+function parseReminderOption(value) {
+  if (value == null) return { type: "at_time" };
+
+  if (typeof value === "number" && isFinite(value)) {
+    // interpret as minutes before
+    const minutes = Math.max(0, Math.round(value));
+    if (minutes === 0) return { type: "at_time" };
+    if (minutes % 1440 === 0) return { type: "days_before", days: minutes / 1440 };
+    if (minutes % 60 === 0) return { type: "hours_before", hours: minutes / 60 };
+    return { type: "minutes_before", minutes };
+  }
+
+  const s = String(value).trim().toLowerCase();
+  if (!s) return { type: "at_time" };
+
+  if (s.includes("at time") || s === "at") return { type: "at_time" };
+
+  // Extract first integer number if present
+  const nMatch = s.match(/(\d+)/);
+  const n = nMatch ? parseInt(nMatch[1], 10) : NaN;
+
+  if (!isNaN(n)) {
+    if (s.includes("day")) return { type: "days_before", days: n };
+    if (s.includes("hour")) return { type: "hours_before", hours: n };
+    if (s.includes("minute")) return { type: "minutes_before", minutes: n };
+  }
+
+  // Default fallback
+  return { type: "at_time" };
+}
+
+/**
+ * Parse recurrence option:
+ * - "none", "", null => none
+ * - "weekly" => weekly
+ * - "monthly" => monthly
+ * - "yearly" => yearly
+ */
+function parseRecurrenceOption(value) {
+  const s = String(value ?? "").trim().toLowerCase();
+  if (!s || s === "none" || s === "no") return "none";
+  if (s.includes("week")) return "weekly";
+  if (s.includes("month")) return "monthly";
+  if (s.includes("year")) return "yearly";
+  return "none";
+}
+
+function shiftSundayToMonday(dateObj) {
+  if (!CONFIG.SHIFT_SUNDAY_TO_MONDAY) return dateObj;
+  const d = new Date(dateObj);
+  if (d.getDay() === 0) d.setDate(d.getDate() + 1);
+  return d;
+}
+
+function checkReminders() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) return;
+
+  try {
+    const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SHEET_NAME);
+    if (!sheet) return;
+
+    const range = sheet.getDataRange();
+    const values = range.getValues();
+    const display = range.getDisplayValues();
+    if (values.length <= 1) return;
+
+    const now = new Date();
+    const windowMs = CONFIG.SEND_WINDOW_MINUTES * 60 * 1000;
+    const tz = Session.getScriptTimeZone();
+
+    for (let r = 1; r < values.length; r++) {
+      const row = values[r];
+      const rowDisp = display[r];
+
+      const status = String(row[CONFIG.COL_STATUS - 1] ?? "").trim();
+      if (status) continue;
+
+      const completedVal = CONFIG.COL_COMPLETED ? row[CONFIG.COL_COMPLETED - 1] : "";
+      if (CONFIG.COL_COMPLETED && isCompleted(completedVal)) continue;
+
+      const dateVal = row[CONFIG.COL_EVENT_DATE - 1];
+      const timeVal = row[CONFIG.COL_EVENT_TIME - 1];
+
+      // Prefer Date objects first, then display values
+      const d = parseDateCell(dateVal) || parseDateCell(rowDisp[CONFIG.COL_EVENT_DATE - 1]);
+      const t = parseTimeCell(timeVal) || parseTimeCell(rowDisp[CONFIG.COL_EVENT_TIME - 1]);
+
+      if (!d || !t) {
+        sheet.getRange(r + 1, CONFIG.COL_STATUS).setValue(CONFIG.STATUS_MISSING_DATE_TIME);
+        continue;
+      }
+
+      let eventDate = new Date(d);
+      eventDate.setHours(t.h, t.m, 0, 0);
+      eventDate = shiftSundayToMonday(eventDate);
+
+      // Compute reminder time
+      const reminderRaw = row[CONFIG.COL_REMINDER_OPTION - 1];
+      const reminder = parseReminderOption(reminderRaw);
+
+      let remindTime = new Date(eventDate);
+
+      if (reminder.type === "minutes_before") {
+        remindTime.setMinutes(remindTime.getMinutes() - reminder.minutes);
+      } else if (reminder.type === "hours_before") {
+        remindTime.setHours(remindTime.getHours() - reminder.hours);
+      } else if (reminder.type === "days_before") {
+        remindTime.setDate(remindTime.getDate() - reminder.days);
+        remindTime.setHours(CONFIG.ONE_DAY_BEFORE_AT.hour, CONFIG.ONE_DAY_BEFORE_AT.minute, 0, 0);
+        remindTime = shiftSundayToMonday(remindTime);
+      } else {
+        // at_time
+        remindTime = new Date(eventDate);
+      }
+
+      const nowMs = now.getTime();
+      const startMs = remindTime.getTime();
+      const endMs = startMs + windowMs;
+      if (nowMs < startMs || nowMs > endMs) continue;
+
+      // Recipients
+      const mainEmail = String(row[CONFIG.COL_MAIN_EMAIL - 1] ?? "").trim();
+      let recipients = [];
+      if (mainEmail) recipients.push(mainEmail);
+
+      const extraRaw = String(row[CONFIG.COL_EXTRA_EMAILS - 1] ?? "").trim();
+      if (extraRaw) {
+        recipients = recipients.concat(
+          extraRaw.split(/[;,]/).map(s => s.trim()).filter(Boolean)
+        );
+      }
+
+      recipients = Array.from(new Set(recipients)).filter(Boolean);
+      if (!recipients.length) {
+        sheet.getRange(r + 1, CONFIG.COL_STATUS).setValue(CONFIG.STATUS_MISSING_EMAIL);
+        continue;
+      }
+
+      // Email content
+      const task = escapeHtml(row[CONFIG.COL_TASK - 1] ?? "");
+      const desc = escapeHtml(row[CONFIG.COL_DESCRIPTION - 1] ?? "No description");
+      const whenStr = Utilities.formatDate(eventDate, tz, "EEE, dd/MM/yyyy HH:mm");
+
+      const subject = `⏰ Reminder: ${String(row[CONFIG.COL_TASK - 1] ?? "Task").trim() || "Task"}`;
+
+      const htmlBody = `
+<div style="font-family:Arial,Helvetica,sans-serif;background:#f6f7fb;padding:24px">
+  <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 6px 18px rgba(0,0,0,.08)">
+    <div style="background:linear-gradient(90deg,#6D28D9,#9333EA);padding:18px 22px;color:#fff">
+      <div style="font-size:14px;opacity:.9">Task Reminder</div>
+      <div style="font-size:20px;font-weight:700;line-height:1.2;margin-top:4px">⏰ Time to act</div>
+    </div>
+
+    <div style="padding:20px 22px;color:#111827">
+      <div style="font-size:16px;line-height:1.6">
+        <div style="margin-bottom:10px"><b>Task:</b><br/>
+          <span style="font-size:18px">${task}</span>
+        </div>
+
+        <div style="margin-bottom:10px"><b>Description:</b><br/>
+          <span style="color:#374151">${desc}</span>
+        </div>
+
+        <div style="margin:14px 0;padding:12px 14px;background:#F3F4F6;border-radius:10px">
+          <div style="font-size:13px;color:#6B7280;margin-bottom:4px">SCHEDULED TIME</div>
+          <div style="font-size:18px;font-weight:700">${whenStr}</div>
+        </div>
+
+        <div style="margin-top:14px;font-size:13px;color:#6B7280">
+          Mark the task as <b>Completed</b> in the sheet to stop future reminders.
+        </div>
+      </div>
+    </div>
+
+    <div style="padding:16px 22px;background:#FAFAFB;border-top:1px solid #EEF2FF;color:#6B7280;font-size:12px;line-height:1.5">
+      This message was sent automatically.
+    </div>
+  </div>
+</div>`;
+
+      MailApp.sendEmail({
+        to: recipients.join(","),
+        subject,
+        htmlBody: htmlBody,
+      });
+
+      // Handle recurrence
+      const recurRaw = row[CONFIG.COL_RECURRENCE_OPTION - 1];
+      const recur = parseRecurrenceOption(recurRaw);
+
+      if (recur === "none") {
+        sheet.getRange(r + 1, CONFIG.COL_STATUS).setValue(CONFIG.STATUS_SENT);
+        continue;
+      }
+
+      let nextEventDate = new Date(eventDate);
+      if (recur === "weekly") nextEventDate.setDate(nextEventDate.getDate() + 7);
+      if (recur === "monthly") nextEventDate.setMonth(nextEventDate.getMonth() + 1);
+      if (recur === "yearly") nextEventDate.setFullYear(nextEventDate.getFullYear() + 1);
+
+      nextEventDate = shiftSundayToMonday(nextEventDate);
+
+      // Write next date back (keeps same time)
+      sheet.getRange(r + 1, CONFIG.COL_EVENT_DATE).setValue(nextEventDate);
+      sheet.getRange(r + 1, CONFIG.COL_STATUS).setValue(""); // reset to allow next cycle
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function debugRow(rowNumber) {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SHEET_NAME);
+  const range = sheet.getDataRange();
+  const values = range.getValues();
+  const display = range.getDisplayValues();
+
+  const r = Math.max(2, Number(rowNumber || 2)) - 1;
+  const row = values[r];
+  const rowDisp = display[r];
+
+  const d = parseDateCell(row[CONFIG.COL_EVENT_DATE - 1]) || parseDateCell(rowDisp[CONFIG.COL_EVENT_DATE - 1]);
+  const t = parseTimeCell(row[CONFIG.COL_EVENT_TIME - 1]) || parseTimeCell(rowDisp[CONFIG.COL_EVENT_TIME - 1]);
+
+  console.log({
+    rowNumber: r + 1,
+    dateRaw: row[CONFIG.COL_EVENT_DATE - 1],
+    timeRaw: row[CONFIG.COL_EVENT_TIME - 1],
+    dateDisplay: rowDisp[CONFIG.COL_EVENT_DATE - 1],
+    timeDisplay: rowDisp[CONFIG.COL_EVENT_TIME - 1],
+    parsedDate: d,
+    parsedTime: t,
+    reminderRaw: row[CONFIG.COL_REMINDER_OPTION - 1],
+    recurrenceRaw: row[CONFIG.COL_RECURRENCE_OPTION - 1],
+    status: row[CONFIG.COL_STATUS - 1],
+    completed: CONFIG.COL_COMPLETED ? row[CONFIG.COL_COMPLETED - 1] : null,
+  });
+}
